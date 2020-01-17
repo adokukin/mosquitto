@@ -203,9 +203,6 @@ int mosquitto_topic_matches_sub2(const char *sub, size_t sublen, const char *top
 	spos = 0;
 
 	while(sub[0] != 0){
-		if(topic[0] == '+' || topic[0] == '#'){
-			return MOSQ_ERR_INVAL;
-		}
 		if(sub[0] != topic[0] || topic[0] == 0){ /* Check for wildcard matches */
 			if(sub[0] == '+'){
 				/* Check for bad "+foo" or "a/+foo" subscription */
