@@ -42,6 +42,8 @@ static int last_mid = -1;
 static int last_mid_sent = -1;
 static char *line_buf = NULL;
 static int line_buf_len = 1024;
+static char *line_topic_buf = NULL;
+static int line_topic_buf_len = 256;
 static bool disconnect_sent = false;
 static int publish_count = 0;
 static bool ready_for_repeat = false;
@@ -121,6 +123,30 @@ int my_publish(struct mosquitto *mosq, int *mid, const char *topic, int payloadl
 }
 
 
+int my_publish_integrated_topic(struct mosquitto *mosq, int *mid, int payloadlen, void *payload, int qos, bool retain)
+{
+	char *buf2;
+	char *splitter = strstr(payload, ":");
+	int topiclen = (void *)splitter - payload;
+	if ((splitter == NULL) || (splitter == payload)){
+		return MOSQ_ERR_MALFORMED_PACKET; // TODO: maybe MOSQ_ERR_UNKNOWN is better here?
+	}else if(topiclen >= line_topic_buf_len){ 
+		line_topic_buf_len = topiclen + 1;
+		buf2 = realloc(line_buf, line_topic_buf_len);
+		if(!buf2){
+			err_printf(&cfg, "Error: Out of memory.\n");
+			return MOSQ_ERR_NOMEM;
+		}
+		line_topic_buf = buf2;
+	}
+	
+	strncpy(line_topic_buf, payload, topiclen);
+	line_topic_buf[topiclen] = 0;
+
+	return my_publish(mosq, mid, line_topic_buf, payloadlen - topiclen - 1, splitter + 1, qos, retain);
+}
+
+
 void my_connect_callback(struct mosquitto *mosq, void *obj, int result, int flags, const mosquitto_property *properties)
 {
 	int rc = MOSQ_ERR_SUCCESS;
@@ -140,6 +166,7 @@ void my_connect_callback(struct mosquitto *mosq, void *obj, int result, int flag
 				rc = my_publish(mosq, &mid_sent, cfg.topic, 0, NULL, cfg.qos, cfg.retain);
 				break;
 			case MSGMODE_STDIN_LINE:
+			case MSGMODE_STDIN_LINE_TOPIC:
 				status = STATUS_CONNACK_RECVD;
 				break;
 		}
@@ -194,7 +221,7 @@ void my_publish_callback(struct mosquitto *mosq, void *obj, int mid, int reason_
 	}
 	publish_count++;
 
-	if(cfg.pub_mode == MSGMODE_STDIN_LINE){
+	if((cfg.pub_mode == MSGMODE_STDIN_LINE) || (cfg.pub_mode == MSGMODE_STDIN_LINE_TOPIC)){
 		if(mid == last_mid){
 			mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
 			disconnect_sent = true;
@@ -213,6 +240,11 @@ int pub_shared_init(void)
 {
 	line_buf = malloc(line_buf_len);
 	if(!line_buf){
+		err_printf(&cfg, "Error: Out of memory.\n");
+		return 1;
+	}
+	line_topic_buf = malloc(line_topic_buf_len);
+	if(!line_topic_buf){
 		err_printf(&cfg, "Error: Out of memory.\n");
 		return 1;
 	}
@@ -307,6 +339,93 @@ int pub_stdin_line_loop(struct mosquitto *mosq)
 }
 
 
+int pub_stdin_line_topic_loop(struct mosquitto *mosq)
+{
+	char *buf2;
+	int buf_len_actual = 0;
+	int pos;
+	int rc = MOSQ_ERR_SUCCESS;
+	int read_len;
+	bool stdin_finished = false;
+
+	mosquitto_loop_start(mosq);
+	stdin_finished = false;
+	do{
+		if(status == STATUS_CONNACK_RECVD){
+			pos = 0;
+			read_len = line_buf_len;
+			while(status == STATUS_CONNACK_RECVD && fgets(&line_buf[pos], read_len, stdin)){
+				buf_len_actual = strlen(line_buf);
+				if(line_buf[buf_len_actual-1] == '\n'){
+					line_buf[buf_len_actual-1] = '\0';
+					rc = my_publish_integrated_topic(mosq, &mid_sent, buf_len_actual-1, line_buf, cfg.qos, cfg.retain);
+					pos = 0;
+					if(rc){
+						err_printf(&cfg, "Error: Publish returned %d, disconnecting.\n", rc);
+						mosquitto_disconnect_v5(mosq, MQTT_RC_DISCONNECT_WITH_WILL_MSG, cfg.disconnect_props);
+					}
+					break;
+				}else{
+					line_buf_len += 1024;
+					pos += 1023;
+					read_len = 1024;
+					buf2 = realloc(line_buf, line_buf_len);
+					if(!buf2){
+						err_printf(&cfg, "Error: Out of memory.\n");
+						return MOSQ_ERR_NOMEM;
+					}
+					line_buf = buf2;
+				}
+			}
+			if(pos != 0){
+				rc = my_publish_integrated_topic(mosq, &mid_sent, buf_len_actual, line_buf, cfg.qos, cfg.retain);
+				if(rc){
+					err_printf(&cfg, "Error: Publish returned %d, disconnecting.\n", rc);
+					mosquitto_disconnect_v5(mosq, MQTT_RC_DISCONNECT_WITH_WILL_MSG, cfg.disconnect_props);
+				}
+			}
+			if(feof(stdin)){
+				if(mid_sent == -1){
+					/* Empty file */
+					mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
+					disconnect_sent = true;
+					status = STATUS_DISCONNECTING;
+				}else{
+					last_mid = mid_sent;
+					status = STATUS_WAITING;
+				}
+				stdin_finished = true;
+			}else if(status == STATUS_DISCONNECTED){
+				/* Not end of stdin, so we've lost our connection and must
+				 * reconnect */
+			}
+		}
+
+		if(status == STATUS_WAITING){
+			if(last_mid_sent == last_mid && disconnect_sent == false){
+				mosquitto_disconnect_v5(mosq, 0, cfg.disconnect_props);
+				disconnect_sent = true;
+			}
+#ifdef WIN32
+			Sleep(100);
+#else
+			struct timespec ts;
+			ts.tv_sec = 0;
+			ts.tv_nsec = 100000000;
+			nanosleep(&ts, NULL);
+#endif
+		}
+	}while(stdin_finished == false);
+	mosquitto_loop_stop(mosq, false);
+
+	if(status == STATUS_DISCONNECTED){
+		return MOSQ_ERR_SUCCESS;
+	}else{
+		return rc;
+	}
+}
+
+
 int pub_other_loop(struct mosquitto *mosq)
 {
 	int rc;
@@ -348,6 +467,8 @@ int pub_shared_loop(struct mosquitto *mosq)
 {
 	if(cfg.pub_mode == MSGMODE_STDIN_LINE){
 		return pub_stdin_line_loop(mosq);
+	}else if(cfg.pub_mode == MSGMODE_STDIN_LINE_TOPIC){
+		return pub_stdin_line_topic_loop(mosq);
 	}else{
 		return pub_other_loop(mosq);
 	}
@@ -357,6 +478,7 @@ int pub_shared_loop(struct mosquitto *mosq)
 void pub_shared_cleanup(void)
 {
 	free(line_buf);
+	free(line_topic_buf);
 }
 
 
@@ -400,6 +522,7 @@ void print_usage(void)
 	printf(" -d : enable debug messages.\n");
 	printf(" -D : Define MQTT v5 properties. See the documentation for more details.\n");
 	printf(" -f : send the contents of a file as the message.\n");
+	printf(" -G : read messages from stdin with topic as <topic>:<message>, sending a separate message for each line, no ':' allowed in the topic.\n");
 	printf(" -h : mqtt host to connect to. Defaults to localhost.\n");
 	printf(" -i : id to use for this client. Defaults to mosquitto_pub_ appended with the process id.\n");
 	printf(" -I : define the client id as id_prefix appended with the process id. Useful for when the\n");
@@ -488,6 +611,10 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Error: '-l' mode not available, threading support has not been compiled in.\n");
 		goto cleanup;
 	}
+	if(cfg.pub_mode == MSGMODE_STDIN_LINE_TOPIC){
+		fprintf(stderr, "Error: '-G' mode not available, threading support has not been compiled in.\n");
+		goto cleanup;
+	}
 #endif
 
 	if(cfg.pub_mode == MSGMODE_STDIN_FILE){
@@ -502,7 +629,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if(!cfg.topic || cfg.pub_mode == MSGMODE_NONE){
+	if((!cfg.topic || cfg.pub_mode == MSGMODE_NONE) && (cfg.pub_mode != MSGMODE_STDIN_LINE_TOPIC)){
 		fprintf(stderr, "Error: Both topic and message must be supplied.\n");
 		print_usage();
 		goto cleanup;

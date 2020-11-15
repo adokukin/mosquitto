@@ -32,6 +32,7 @@ Contributors:
 #define MSGMODE_STDIN_FILE 3
 #define MSGMODE_FILE 4
 #define MSGMODE_NULL 5
+#define MSGMODE_STDIN_LINE_TOPIC 6
 
 #define CLIENT_PUB 1
 #define CLIENT_SUB 2

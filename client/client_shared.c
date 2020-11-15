@@ -568,6 +568,16 @@ int client_config_line_proc(struct mosq_config *cfg, int pub_or_sub, int argc, c
 				}
 			}
 			i++;
+		}else if(!strcmp(argv[i], "-G")){
+			if(pub_or_sub != CLIENT_PUB){
+				goto unknown_option;
+			}
+			if(cfg->pub_mode != MSGMODE_NONE){
+				fprintf(stderr, "Error: Only one type of message can be sent at once.\n\n");
+				return 1;
+			}else{
+				cfg->pub_mode = MSGMODE_STDIN_LINE_TOPIC;
+			}
 		}else if(!strcmp(argv[i], "--help")){
 			return 2;
 		}else if(!strcmp(argv[i], "-h") || !strcmp(argv[i], "--host")){
